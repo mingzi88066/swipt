@@ -322,14 +322,14 @@ func (w *axWorker) ended() {
 	defer cancel()
 	pid, err := w.daemonPID(ctx)
 	if err != nil {
-		w.logger.Debug(E.Cause(err, "find axauditd"))
+		w.logger.Warn(E.Cause(err, "find axauditd, which may be regenerating the frontmost application's tree at each change of the screen"))
 		return
 	}
 	if served != 0 && pid != served {
 		pid = 0
 	}
 	if err = w.kill(ctx, pid, "its connection ended while it kept running"); err != nil {
-		w.logger.Debug(E.Cause(err, "restart axauditd"))
+		w.logger.Warn(E.Cause(err, "restart axauditd"))
 	}
 }
 
@@ -354,6 +354,14 @@ func (w *axWorker) closeClient() {
 	}
 	w.conn.connection.setAXClean(err == nil)
 	w.client = nil
+	if err != nil && w.conn.ctx.Err() == nil {
+		// An unclean close may have left the device's axauditd generating the
+		// frontmost application's tree at each change of the screen, for no
+		// client, so the daemon is killed to end it (iOS 27.3 24C5037i).
+		if killErr := w.restart("its connection was not closed cleanly"); killErr != nil {
+			w.logger.Warn(E.Cause(killErr, "restart axauditd after an unclean close"))
+		}
+	}
 }
 
 // axauditd accepts remoteAXService connections on its main queue and gives
