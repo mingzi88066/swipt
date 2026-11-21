@@ -1,0 +1,8 @@
+/.idea/
+/Frameworks/
+xcuserdata/
+.DS_Store
+/build/
+node_modules/
+/.next/
+/cli/dist/

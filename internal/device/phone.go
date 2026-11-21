@@ -1,0 +1,788 @@
+package device
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+
+	"github.com/sagernet/sing/common"
+	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
+	"github.com/swipt-automation/swipt/internal/coredevice/accessibility"
+	"github.com/swipt-automation/swipt/internal/coredevice/display"
+	"github.com/swipt-automation/swipt/internal/coredevice/hid"
+	"github.com/swipt-automation/swipt/internal/coredevice/pasteboard"
+)
+
+const (
+	phoneGeometryLife = time.Second
+	phoneEdgeRegion   = 4.0
+)
+
+type Point struct {
+	X, Y float64
+}
+
+type Rect struct {
+	X, Y, Width, Height float64
+}
+
+func (r Rect) Center() Point {
+	return Point{r.X + r.Width/2, r.Y + r.Height/2}
+}
+
+func (r Rect) Contains(at Point) bool {
+	return at.X >= r.X && at.X <= r.X+r.Width && at.Y >= r.Y && at.Y <= r.Y+r.Height
+}
+
+func (r Rect) Intersect(other Rect) Rect {
+	x, y := max(r.X, other.X), max(r.Y, other.Y)
+	return Rect{x, y, max(min(r.X+r.Width, other.X+other.Width)-x, 0), max(min(r.Y+r.Height, other.Y+other.Height)-y, 0)}
+}
+
+func (r Rect) Empty() bool {
+	return r.Width <= 0 || r.Height <= 0
+}
+
+type PhoneScreen struct {
+	Width, Height float64
+	Scale         float64
+	Orientation   string
+}
+
+type Phone struct {
+	connection *Connection
+	logger     logger.ContextLogger
+
+	captureAccess sync.Mutex
+
+	locationAccess sync.Mutex
+	location       *simulatedLocation
+}
+
+type simulatedLocation struct {
+	latitude, longitude float64
+	release             func()
+}
+
+func (s *Connection) Phone() *Phone {
+	return s.phone
+}
+
+func (p *Phone) begin(ctx context.Context) (*conn, context.Context, func(), error) {
+	c, release, err := p.connection.acquire(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	operation, cancel := c.operation(ctx)
+	return c, operation, func() {
+		cancel()
+		release()
+	}, nil
+}
+
+func (p *Phone) Interrupted(since time.Time) bool {
+	s := p.connection
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.interruptedLocked(since)
+}
+
+func (p *Phone) DropCause() error {
+	s := p.connection
+	s.access.Lock()
+	defer s.access.Unlock()
+	if s.attached != nil && s.attached.device.Err() != nil {
+		return s.attached.device.Err()
+	}
+	return s.detachCause
+}
+
+func (p *Phone) Disconnected(since time.Time) bool {
+	s := p.connection
+	s.access.Lock()
+	defer s.access.Unlock()
+	if s.closed || s.unavailable != nil || s.failure != nil {
+		return false
+	}
+	return s.attached == nil || s.interruptedLocked(since)
+}
+
+func (s *Connection) interruptedLocked(since time.Time) bool {
+	return s.detachedAt.After(since) || s.attached != nil && s.attached.device.Closed()
+}
+
+func (p *Phone) Availability() (<-chan struct{}, error) {
+	s := p.connection
+	s.access.Lock()
+	defer s.access.Unlock()
+	if s.unavailable != nil {
+		return s.availability, E.Cause1(ErrUnavailable, s.unavailable)
+	}
+	return s.availability, nil
+}
+
+func (p *Phone) WaitConnected(ctx context.Context) error {
+	release := p.connection.hold()
+	defer release()
+	_, err := p.connection.waitConn(ctx, true)
+	return err
+}
+
+type phoneGeometry struct {
+	PhoneScreen
+	turns   int
+	display display.DisplayInfo
+}
+
+func (c *conn) readGeometry(ctx context.Context) (phoneGeometry, error) {
+	c.geometryAccess.Lock()
+	defer c.geometryAccess.Unlock()
+	if time.Since(c.geometryAt) < phoneGeometryLife || c.connection.screens.steadySince(c.geometryAt) {
+		return c.geometry, nil
+	}
+	asked := time.Now()
+	active, err := c.activeDisplay(ctx)
+	if err != nil {
+		return phoneGeometry{}, err
+	}
+	scale := float64(max(active.PointScale, 1))
+	turns := orientationTurns(active.CurrentOrientation)
+	width, height := active.Width, active.Height
+	if turns%2 == 1 {
+		width, height = height, width
+	}
+	touch := touchTurns(active, width, height)
+	orientation := "portrait"
+	switch {
+	case width > height:
+		orientation = "landscape"
+	case turns == 2:
+		orientation = "portraitUpsideDown"
+	}
+	c.geometry = phoneGeometry{
+		PhoneScreen: PhoneScreen{Width: float64(width) / scale, Height: float64(height) / scale, Scale: scale, Orientation: orientation},
+		turns:       touch,
+		display:     active,
+	}
+	c.geometryAt = asked
+	return c.geometry, nil
+}
+
+func (g phoneGeometry) check(at Point) error {
+	if at.X < 0 || at.X > g.Width || at.Y < 0 || at.Y > g.Height {
+		return E.New("the point [", at.X, ", ", at.Y, "] is outside the ", g.Width, "x", g.Height, " screen")
+	}
+	return nil
+}
+
+func (g phoneGeometry) touch(at Point) hid.Touch {
+	u := clamp(at.X/g.Width, 0, 1)
+	v := clamp(at.Y/g.Height, 0, 1)
+	for range g.turns {
+		u, v = v, 1-u
+	}
+	return hid.Touch{X: u, Y: v}
+}
+
+// The system-wide hit test takes a point in the digitizer's orientation
+// (iPadOS 27.2 24B115).
+func (g phoneGeometry) digitizer(at Point) accessibility.LayoutPoint {
+	touch := g.touch(at)
+	width, height := g.Width, g.Height
+	if g.turns%2 == 1 {
+		width, height = height, width
+	}
+	return accessibility.LayoutPoint{X: touch.X * width, Y: touch.Y * height}
+}
+
+func (g phoneGeometry) edge(at Point) hid.Edge {
+	distances := [4]float64{at.Y, g.Width - at.X, g.Height - at.Y, at.X}
+	nearest := -1
+	for side, distance := range distances {
+		if distance <= phoneEdgeRegion && (nearest < 0 || distance < distances[nearest]) {
+			nearest = side
+		}
+	}
+	if nearest < 0 {
+		return hid.EdgeNone
+	}
+	edges := [4]hid.Edge{hid.EdgeTop, hid.EdgeRight, hid.EdgeBottom, hid.EdgeLeft}
+	return edges[(nearest-g.turns)&3]
+}
+
+// An application that keeps the interface orientation reports its frames in
+// it; SpringBoard's windows report theirs in the digitizer's space whatever
+// the orientation (iOS 27.2 24B5110a), and that space is portrait on an iPad
+// whose display is landscape native (iPadOS 27.2 24B115). Some of
+// SpringBoard's windows report their frames and those of their contents in
+// pixels (iOS 27.2 24B115).
+type axSpace struct {
+	geometry      phoneGeometry
+	rotated       bool
+	width, height float64
+	pid, context  uint64
+}
+
+func spaceOf(geometry phoneGeometry, app accessibility.Element) axSpace {
+	return axSpace{geometry: geometry, pid: app.Ref.PID, context: app.Context}.window(app.Frame)
+}
+
+func (s axSpace) window(frame *accessibility.LayoutFrame) axSpace {
+	out := s
+	out.rotated, out.width, out.height = false, 0, 0
+	if frame == nil || frame.Width <= 0 || frame.Height <= 0 {
+		return out
+	}
+	switch {
+	case (frame.Width > frame.Height) != (s.geometry.Width > s.geometry.Height):
+		out.rotated, out.width, out.height = true, frame.Width, frame.Height
+	case math.Abs(frame.Width-s.geometry.Width*s.geometry.Scale) < 1 && math.Abs(frame.Height-s.geometry.Height*s.geometry.Scale) < 1:
+		out.width, out.height = frame.Width, frame.Height
+	}
+	return out
+}
+
+func (s axSpace) point(at accessibility.LayoutPoint) Point {
+	if s.width == 0 {
+		return Point{at.X, at.Y}
+	}
+	u, v := at.X/s.width, at.Y/s.height
+	if s.rotated {
+		for range s.geometry.turns {
+			u, v = 1-v, u
+		}
+	}
+	return Point{u * s.geometry.Width, v * s.geometry.Height}
+}
+
+func (s axSpace) rect(frame accessibility.LayoutFrame) Rect {
+	first := s.point(accessibility.LayoutPoint{X: frame.X, Y: frame.Y})
+	second := s.point(accessibility.LayoutPoint{X: frame.X + frame.Width, Y: frame.Y + frame.Height})
+	return Rect{X: min(first.X, second.X), Y: min(first.Y, second.Y), Width: math.Abs(second.X - first.X), Height: math.Abs(second.Y - first.Y)}
+}
+
+// A widget or Live Activity has a render context of its own, placed on the
+// screen at an offset the translator does not report; web content reports
+// none and is in the application's space (iOS 27.2 24B5110a).
+func (s axSpace) remote(element accessibility.Element) bool {
+	return s.context != 0 && element.Context != 0 && element.Ref.PID != s.pid && element.Context != s.context
+}
+
+type PhoneNode struct {
+	AX        accessibility.Element
+	Frame     Rect
+	Visible   Rect
+	Point     Point
+	Covered   bool
+	Inert     bool
+	Remote    bool
+	Web       bool
+	Focused   bool
+	Truncated bool
+	Clip      Rect
+	Children  []*PhoneNode
+	Parent    *PhoneNode
+
+	model  *PhoneModel
+	space  axSpace
+	axClip accessibility.LayoutFrame
+}
+
+func (n *PhoneNode) HasFrame() bool {
+	return n.AX.Frame != nil && !n.Remote
+}
+
+func (n *PhoneNode) Shown() bool {
+	return n.HasFrame() && !n.Visible.Empty()
+}
+
+func (n *PhoneNode) Contains(other *PhoneNode) bool {
+	for ; other != nil; other = other.Parent {
+		if other == n {
+			return true
+		}
+	}
+	return false
+}
+
+type PhoneModel struct {
+	BundleID  string
+	Root      *PhoneNode
+	System    *PhoneNode
+	Truncated []*PhoneNode
+
+	app        accessibility.Element
+	nodes      map[accessibility.ElementRef]*PhoneNode
+	generation uint64
+	read       SnapshotOptions
+}
+
+func (m *PhoneModel) Node(ref accessibility.ElementRef) *PhoneNode {
+	return m.nodes[ref]
+}
+
+func walkNodes(root *PhoneNode, visit func(node *PhoneNode)) {
+	visit(root)
+	for _, child := range root.Children {
+		walkNodes(child, visit)
+	}
+}
+
+// Automation types that XCTest converts to XCUIElementTypeWindow,
+// XCUIElementTypeKeyboard and XCUIElementTypeStatusBar (Xcode 27.1 27A9275
+// XCTAutomationSupport _XCTElementTypeFromAXAutomationType 0x1e444, table
+// 0x46e28).
+const (
+	windowAutomationType    = 2
+	keyboardAutomationType  = 19
+	statusBarAutomationType = 25
+)
+
+func modelOf(geometry phoneGeometry, screen *accessibility.Screen, base *PhoneNode) *PhoneModel {
+	model := &PhoneModel{BundleID: screen.BundleID, app: screen.App, nodes: make(map[accessibility.ElementRef]*PhoneNode)}
+	space := spaceOf(geometry, screen.Root.Element)
+	if base != nil {
+		space = base.space
+	}
+	model.Root = model.convert(space, screen.Root, nil, screen.Focused)
+	if base != nil && base.Inert {
+		walkNodes(model.Root, func(node *PhoneNode) { node.Inert = true })
+	}
+	if screen.System != nil {
+		model.System = model.convert(spaceOf(geometry, screen.System.Element), screen.System, nil, nil)
+	}
+	var keyboard, input *PhoneNode
+	walkNodes(model.Root, func(node *PhoneNode) {
+		if keyboard == nil && node.AX.Type == keyboardAutomationType && node.Shown() {
+			keyboard = node
+		}
+	})
+	var over []Rect
+	if keyboard != nil {
+		over = append(over, keyboard.Visible)
+		input = keyboard.window()
+	}
+	if model.System != nil {
+		walkNodes(model.System, func(node *PhoneNode) {
+			if node.Shown() && node.AX.AccessibilityElement && len(node.Children) == 0 && !node.inStatusBar() {
+				over = append(over, node.Visible)
+			}
+		})
+	}
+	walkNodes(model.Root, func(node *PhoneNode) {
+		if node.Shown() && (input == nil || !input.Contains(node)) {
+			node.Covered = slices.ContainsFunc(over, func(rect Rect) bool { return rect.Contains(node.Point) })
+		}
+	})
+	return model
+}
+
+// The keyboard has a window of its own, which also holds the candidate bar
+// outside the keyboard (iOS 27.2 24B115).
+func (n *PhoneNode) window() *PhoneNode {
+	for node := n; node != nil; node = node.Parent {
+		if node.AX.Type == windowAutomationType {
+			return node
+		}
+	}
+	return n
+}
+
+func (n *PhoneNode) context() uint64 {
+	for node := n; node != nil; node = node.Parent {
+		if node.AX.Context != 0 {
+			return node.AX.Context
+		}
+	}
+	return 0
+}
+
+func (n *PhoneNode) inStatusBar() bool {
+	for node := n; node != nil; node = node.Parent {
+		if node.AX.Type == statusBarAutomationType {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *PhoneModel) convert(space axSpace, node *accessibility.TreeNode, parent *PhoneNode, focused *accessibility.ElementRef) *PhoneNode {
+	if node.Type == windowAutomationType && node.Frame != nil {
+		space = space.window(node.Frame)
+	}
+	out := &PhoneNode{
+		AX: node.Element, Inert: node.Inert, Web: node.Web, Truncated: node.Truncated, Parent: parent, Remote: space.remote(node.Element),
+		model: m, space: space, axClip: node.Clip,
+	}
+	m.nodes[node.Ref] = out
+	if out.Truncated {
+		m.Truncated = append(m.Truncated, out)
+	}
+	if out.HasFrame() {
+		out.Frame = space.rect(*node.Frame)
+		out.Clip = space.rect(node.Clip)
+		out.Visible = out.Frame.Intersect(out.Clip).Intersect(Rect{Width: space.geometry.Width, Height: space.geometry.Height})
+		out.Point = out.Visible.Center()
+		if activation := node.Activation; activation != nil {
+			if point := space.point(*activation); out.Visible.Contains(point) {
+				out.Point = point
+			}
+		}
+	}
+	out.Focused = focused != nil && *focused == node.Ref && node.TextEntry()
+	for _, child := range node.Children {
+		out.Children = append(out.Children, m.convert(space, child, out, focused))
+	}
+	return out
+}
+
+type SnapshotScope uint8
+
+const (
+	ScopeFullScreen SnapshotScope = iota
+	ScopeFrontApp
+	ScopeSpringBoard
+)
+
+type SnapshotOptions struct {
+	Scope  SnapshotScope
+	Raw    bool
+	Depth  int64
+	Within string
+}
+
+func (o SnapshotOptions) key() string {
+	depth := strconv.FormatInt(o.Depth, 10)
+	switch {
+	case o.Within != "":
+		return "within:" + o.Within + ":" + depth
+	case o.Scope == ScopeFrontApp:
+		return "front:" + depth
+	case o.Scope == ScopeSpringBoard:
+		return "springBoard:" + depth
+	}
+	return "fullScreen:" + depth
+}
+
+func (p *Phone) read(ctx context.Context, c *conn, options SnapshotOptions) (*PhoneModel, error) {
+	options.Raw = false
+	geometry, err := c.readGeometry(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var base *PhoneNode
+	var springboard uint64
+	switch {
+	case options.Within != "":
+		if base, err = p.element(c, options.Within); err != nil {
+			return nil, err
+		}
+	case options.Scope != ScopeFrontApp:
+		if springboard, err = c.springboardPID(ctx); err != nil {
+			return nil, err
+		}
+	}
+	value, err := c.ax.read(ctx, options.key(), func(ctx context.Context, client *accessibility.RemoteClient) (any, error) {
+		return p.readScreen(ctx, c, client, geometry, springboard, base, options)
+	})
+	if err != nil {
+		return nil, err
+	}
+	model := value.(*PhoneModel)
+	c.nodes.add(model)
+	return model, nil
+}
+
+func (p *Phone) readScreen(ctx context.Context, c *conn, client *accessibility.RemoteClient, geometry phoneGeometry, springboard uint64, base *PhoneNode, options SnapshotOptions) (*PhoneModel, error) {
+	started := time.Now()
+	var screen *accessibility.Screen
+	var err error
+	switch {
+	case base != nil:
+		screen, err = client.ReadApplication(ctx, accessibility.ApplicationOptions{
+			Root: &base.AX, Clip: &base.axClip, Depth: options.Depth, Modal: true, Focused: true, Expand: true,
+		})
+	case options.Scope == ScopeFrontApp:
+		screen, err = client.ReadApplication(ctx, accessibility.ApplicationOptions{Depth: options.Depth, Focused: true, Expand: true})
+	case options.Scope == ScopeSpringBoard:
+		screen, err = client.ReadApplication(ctx, accessibility.ApplicationOptions{PID: springboard, Depth: options.Depth})
+		if E.IsMulti(err, accessibility.ErrNoAnswer, accessibility.ErrNoApplication) {
+			c.springboard.CompareAndSwap(springboard, 0)
+		}
+	default:
+		screen, err = client.ReadScreen(ctx, springboard, options.Depth, nil)
+		if errors.Is(err, accessibility.ErrNoApplication) {
+			c.springboard.Store(0)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return p.model(c, geometry, screen, started, base, options), nil
+}
+
+func (p *Phone) model(c *conn, geometry phoneGeometry, screen *accessibility.Screen, started time.Time, base *PhoneNode, read SnapshotOptions) *PhoneModel {
+	model := modelOf(geometry, screen, base)
+	model.generation = c.ax.current()
+	model.read = read
+	root := "the application"
+	if base != nil {
+		root = "element " + refText(base.AX.Ref)
+	}
+	p.logger.Debug("read ", len(model.nodes), " nodes of ", model.BundleID, " from ", root, " to depth ", read.Depth, " in ", time.Since(started),
+		", rounds ", fmt.Sprint(screen.Rounds))
+	if len(model.Truncated) > 0 {
+		p.logger.Info("the read of ", model.BundleID, " from ", root, " stopped at depth ", read.Depth, " above the children of ", len(model.Truncated), " elements: ",
+			strings.Join(common.Map(model.Truncated, func(node *PhoneNode) string { return refText(node.AX.Ref) + " " + describeElement(node.AX) }), ", "))
+	}
+	c.ax.answered(screen.App.Ref.PID)
+	return model
+}
+
+func (p *Phone) Snapshot(ctx context.Context, options SnapshotOptions) (*View, error) {
+	if err := checkDepth(options.Depth); err != nil {
+		return nil, err
+	}
+	c, ctx, done, err := p.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	started := time.Now()
+	model, err := p.read(ctx, c, options)
+	if err != nil {
+		return nil, err
+	}
+	p.connection.trace(started, "snapshot.read", strconv.Itoa(len(model.nodes))+" nodes of "+model.BundleID+", "+strconv.Itoa(len(model.Truncated))+" cut off", time.Since(started))
+	return NewView(model, options.Raw), nil
+}
+
+func checkDepth(depth int64) error {
+	if depth < 0 || depth > accessibility.MaxDepth {
+		return E.Extend(ErrInvalid, "depth must be an integer from 0 to ", accessibility.MaxDepth, ", the most one read of the device carries")
+	}
+	return nil
+}
+
+type PhoneInfo struct {
+	Name, Model, OSVersion, Build string
+	Language                      string
+	Screen                        PhoneScreen
+}
+
+type Environment struct {
+	OSVersion string
+	Languages []string
+	TimeZone  string
+}
+
+func (p *Phone) Environment() Environment {
+	s := p.connection
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.environmentLocked()
+}
+
+func (s *Connection) environmentLocked() Environment {
+	environment := Environment{OSVersion: s.info.OSVersion, Languages: []string{"en"}, TimeZone: s.timeZone}
+	if s.language != "" {
+		environment.Languages = []string{s.language}
+	}
+	return environment
+}
+
+func (p *Phone) Info(ctx context.Context) (PhoneInfo, error) {
+	c, ctx, done, err := p.begin(ctx)
+	if err != nil {
+		return PhoneInfo{}, err
+	}
+	defer done()
+	info := c.device.Info()
+	out := PhoneInfo{Name: *p.connection.name.Load(), Model: info.ProductType, OSVersion: info.OSVersion, Build: info.BuildVersion}
+	geometry, err := c.readGeometry(ctx)
+	if err != nil {
+		return PhoneInfo{}, err
+	}
+	out.Screen = geometry.PhoneScreen
+	out.Language, err = c.device.Language(ctx)
+	if err != nil {
+		return PhoneInfo{}, err
+	}
+	s := p.connection
+	s.access.Lock()
+	changed := out.Language != s.language
+	s.language = out.Language
+	s.access.Unlock()
+	if changed {
+		s.syncEnvironment()
+	}
+	return out, nil
+}
+
+func (p *Phone) Locked(ctx context.Context) (bool, error) {
+	c, ctx, done, err := p.begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer done()
+	locked, err := c.lockState.locked(ctx, c.device)
+	if err != nil {
+		return false, E.Cause(err, "read the lock state")
+	}
+	return locked, nil
+}
+
+func (p *Phone) Display(ctx context.Context) (string, error) {
+	c, ctx, done, err := p.begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer done()
+	return c.backlight(ctx)
+}
+
+func (p *Phone) Frontmost(ctx context.Context) (string, error) {
+	c, ctx, done, err := p.begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer done()
+	front, err := c.front.get(ctx)
+	return front.bundleID, err
+}
+
+func (p *Phone) WatchForeground(ctx context.Context, emit func(string)) error {
+	var last string
+	for {
+		c, operation, done, err := p.begin(ctx)
+		if err != nil {
+			return err
+		}
+		changed := make(chan struct{}, 1)
+		cancel := c.front.watch(func(ForegroundApp) {
+			select {
+			case changed <- struct{}{}:
+			default:
+			}
+		})
+		for operation.Err() == nil {
+			wait := time.Duration(-1)
+			if front, err := c.front.get(operation); err == nil {
+				if front.bundleID != last {
+					last = front.bundleID
+					emit(last)
+				}
+			} else if operation.Err() == nil {
+				p.logger.Debug(E.Cause(err, "read the frontmost application"))
+				wait = time.Second
+			}
+			var retry <-chan time.Time
+			if wait > 0 {
+				retry = time.After(wait)
+			}
+			select {
+			case <-changed:
+			case <-retry:
+			case <-operation.Done():
+			}
+		}
+		cancel()
+		done()
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+	}
+}
+
+func (c *conn) localBacklight() (string, bool) {
+	read := c.connection.options.BacklightState
+	if read == nil {
+		return "", false
+	}
+	switch read() {
+	case 0:
+		return "off", true
+	case 1:
+		return "inactiveOn", true
+	case 2:
+		return "activeOn", true
+	case 3:
+		return "dimmed", true
+	}
+	return "", false
+}
+
+func (c *conn) backlight(ctx context.Context) (string, error) {
+	if state, local := c.localBacklight(); local {
+		return state, nil
+	}
+	state, err := c.display.BacklightState(ctx)
+	if err != nil {
+		return "", E.Cause(err, "read the backlight state")
+	}
+	return state, nil
+}
+
+func (p *Phone) Clipboard(ctx context.Context) (string, bool, error) {
+	c, ctx, done, err := p.begin(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	defer done()
+	snapshot, err := c.pasteboard.Read(ctx)
+	if errors.Is(err, pasteboard.ErrRefused) {
+		return "", false, E.New("the clipboard holds an item the device does not hand out, such as a copied password")
+	}
+	if err != nil {
+		return "", false, err
+	}
+	text, ok := snapshot.Text()
+	return text, ok, nil
+}
+
+func (p *Phone) SetClipboard(ctx context.Context, text *string) error {
+	c, ctx, done, err := p.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer done()
+	written := make(chan error, 1)
+	if text == nil {
+		err = c.pasteboard.Clear(ctx, func(err error) { written <- err })
+	} else {
+		err = c.pasteboard.WriteText(ctx, *text, func(err error) { written <- err })
+	}
+	if err != nil {
+		return err
+	}
+	select {
+	case err = <-written:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Safari's tab bar reports its address after a U+200E (iOS 27.2 24B115), and
+// phone numbers put U+00A0 between groups (iOS 27.0.1 24A446).
+func PlainText(text string) string {
+	return strings.Map(plainRune, text)
+}
+
+func plainRune(r rune) rune {
+	switch {
+	case unicode.Is(unicode.Bidi_Control, r):
+		return -1
+	case r == '\u00a0', r == '\u2007', r == '\u2009', r == '\u202f':
+		return ' '
+	}
+	return r
+}

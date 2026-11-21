@@ -1,0 +1,416 @@
+package pairing
+
+// The responder is a port of idevice's PairableHost
+// (https://github.com/jkcoxson/idevice, idevice/src/remote_pairing/responder.rs),
+// MIT License, Copyright (c) Jackson Coxson.
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
+	"math/big"
+	"net"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
+	"github.com/swipt-automation/swipt/internal/coredevice/tlv8"
+
+	"github.com/google/uuid"
+)
+
+// idevice PairableHost advertises _remotepairing-pairable-host._tcp
+// (idevice 3854a5d, idevice/src/remote_pairing/responder.rs:38).
+const ServiceType = "_remotepairing-pairable-host._tcp"
+
+const (
+	// idevice PairableHostInfo defaults to Mac17,7
+	// (idevice 3854a5d, idevice/src/remote_pairing/responder.rs:115).
+	responderModel = "Mac17,7"
+
+	// idevice PairableHostInfo defaults to wire version 26, answers with
+	// minimum version 8, and advertises minVer=17 (idevice 3854a5d,
+	// idevice/src/remote_pairing/responder.rs:118, 229, 106).
+	responderWireProtocolVersion = 26
+	responderMinimumWireProtocol = 8
+	responderMinimumWireless     = 17
+)
+
+type ResponderOptions struct {
+	HostName string
+	OnPIN    func(pin string)
+	Identity *Record
+	Logger   logger.ContextLogger
+}
+
+type Responder struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	options  ResponderOptions
+	logger   logger.ContextLogger
+	listener *net.TCPListener
+	identity *Record
+
+	drainAccess sync.Mutex
+	draining    map[net.Conn]struct{}
+	closed      bool
+}
+
+func NewResponder(options ResponderOptions) (*Responder, error) {
+	if options.Logger == nil {
+		options.Logger = logger.NOP()
+	}
+	identity, err := newIdentity(options.Identity)
+	if err != nil {
+		return nil, err
+	}
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{})
+	if err != nil {
+		return nil, E.Cause(err, "responder: listen")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Responder{ctx: ctx, cancel: cancel, options: options, logger: options.Logger, listener: listener, identity: identity}, nil
+}
+
+func newIdentity(previous *Record) (*Record, error) {
+	var identity Record
+	if previous == nil {
+		publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return nil, err
+		}
+		identity = Record{
+			Identifier: strings.ToUpper(uuid.NewString()),
+			PublicKey:  publicKey,
+			PrivateKey: privateKey,
+		}
+	} else {
+		identity = Record{
+			Identifier: previous.Identifier,
+			PublicKey:  previous.PublicKey,
+			PrivateKey: previous.PrivateKey,
+			HostIRK:    previous.HostIRK,
+		}
+	}
+	if len(identity.HostIRK) != 16 {
+		identity.HostIRK = make([]byte, 16)
+		rand.Read(identity.HostIRK)
+	}
+	return &identity, nil
+}
+
+func (r *Responder) Port() uint16 {
+	return uint16(r.listener.Addr().(*net.TCPAddr).Port)
+}
+
+// idevice requires the Bonjour instance name to be the identifier that its
+// TXT record carries and its authTag is derived from (idevice 3854a5d,
+// idevice/src/remote_pairing/responder.rs:89-93).
+func (r *Responder) ServiceName() string {
+	return r.identity.Identifier
+}
+
+// idevice advertises these TXT keys with flags=1
+// (idevice 3854a5d, idevice/src/remote_pairing/responder.rs:94-108).
+func (r *Responder) TXTRecord() map[string]string {
+	return map[string]string{
+		"name":       r.options.HostName,
+		"identifier": r.identity.Identifier,
+		"authTag":    base64.StdEncoding.EncodeToString(AuthTag(r.identity.HostIRK, r.identity.Identifier)),
+		"model":      responderModel,
+		"flags":      "1",
+		"ver":        strconv.Itoa(responderWireProtocolVersion),
+		"minVer":     strconv.Itoa(responderMinimumWireless),
+	}
+}
+
+const responderConnections = 8
+
+type acceptState struct {
+	ctx     context.Context
+	results chan acceptResult
+	access  sync.Mutex
+	attempt uint64
+}
+
+type acceptResult struct {
+	record *Record
+	err    error
+}
+
+func (r *Responder) Accept(ctx context.Context) (*Record, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stopClose := context.AfterFunc(r.ctx, cancel)
+	defer stopClose()
+	state := &acceptState{ctx: ctx, results: make(chan acceptResult, 1)}
+	listenerStopped := make(chan struct{})
+	stopListener := context.AfterFunc(ctx, func() {
+		r.listener.SetDeadline(time.Unix(1, 0))
+		close(listenerStopped)
+	})
+	var group sync.WaitGroup
+	acceptErr := make(chan error, 1)
+	group.Go(func() {
+		slots := make(chan struct{}, responderConnections)
+		for {
+			select {
+			case slots <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			netConn, err := r.listener.Accept()
+			if err != nil {
+				acceptErr <- err
+				return
+			}
+			group.Go(func() {
+				r.serve(state, netConn)
+				<-slots
+			})
+		}
+	})
+	var result acceptResult
+	select {
+	case result = <-state.results:
+	case err := <-acceptErr:
+		result.err = contextError(ctx, err)
+	case <-ctx.Done():
+		select {
+		case result = <-state.results:
+		default:
+			result.err = ctx.Err()
+		}
+	}
+	cancel()
+	group.Wait()
+	if !stopListener() {
+		<-listenerStopped
+	}
+	r.listener.SetDeadline(time.Time{})
+	return result.record, result.err
+}
+
+func (r *Responder) serve(state *acceptState, netConn net.Conn) {
+	r.logger.Debug("pairing connection from ", netConn.RemoteAddr())
+	stopClose := context.AfterFunc(state.ctx, func() { netConn.Close() })
+	c := newConn(netConn, originDevice)
+	record, attempt, err := r.pair(state, c)
+	if err == nil && !stopClose() {
+		err = state.ctx.Err()
+	}
+	if err != nil {
+		stopClose()
+		netConn.Close()
+		if attempt == 0 || state.ctx.Err() != nil || !state.isLast(attempt) {
+			r.logger.Debug("pairing connection from ", netConn.RemoteAddr(), " closed: ", err)
+			return
+		}
+		state.report(acceptResult{err: err})
+		return
+	}
+	state.report(acceptResult{record: record})
+	r.drain(c)
+}
+
+func (r *Responder) pair(state *acceptState, c *conn) (record *Record, attempt uint64, err error) {
+	err = r.handshake(c)
+	if err != nil {
+		return nil, 0, err
+	}
+	data, err := c.readPairingData()
+	if err != nil {
+		return nil, 0, E.Cause(err, "read pair-setup M1")
+	}
+	m1, err := tlv8.Decode(data)
+	if err != nil || m1.State() != 1 {
+		return nil, 0, E.New("unexpected pair-setup M1 ", hex.EncodeToString(data))
+	}
+	return r.pairSetup(state, c)
+}
+
+func (s *acceptState) isLast(attempt uint64) bool {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return attempt == s.attempt
+}
+
+func (s *acceptState) report(result acceptResult) {
+	select {
+	case s.results <- result:
+	default:
+	}
+}
+
+func (r *Responder) drain(c *conn) {
+	r.drainAccess.Lock()
+	if r.closed {
+		r.drainAccess.Unlock()
+		c.conn.Close()
+		return
+	}
+	if r.draining == nil {
+		r.draining = make(map[net.Conn]struct{})
+	}
+	r.draining[c.conn] = struct{}{}
+	r.drainAccess.Unlock()
+	go func() {
+		defer func() {
+			r.drainAccess.Lock()
+			delete(r.draining, c.conn)
+			r.drainAccess.Unlock()
+			c.conn.Close()
+		}()
+		if tcpConn, isTCP := c.conn.(*net.TCPConn); isTCP {
+			tcpConn.CloseWrite()
+		}
+		for {
+			message, err := c.read()
+			if err != nil {
+				return
+			}
+			r.logger.Debug("message after pair-setup from ", c.conn.RemoteAddr(), ": ", fmt.Sprint(message.Plain))
+		}
+	}()
+}
+
+// Handshake keys and option values match idevice PairableHost defaults
+// (idevice 3854a5d, idevice/src/remote_pairing/responder.rs:111-123, 181-246).
+func (r *Responder) handshake(c *conn) error {
+	request, err := c.readPlain()
+	if err != nil {
+		return E.Cause(err, "read handshake")
+	}
+	handshake := lookupObject(request, "request", "_0", "handshake", "_0")
+	if handshake == nil {
+		return E.New("unexpected handshake request ", fmt.Sprint(request))
+	}
+	r.logger.Debug("pairing handshake: ", fmt.Sprint(handshake))
+	if attempt, _ := lookup(handshake, "hostOptions", "attemptPairVerify").(bool); attempt {
+		return E.New("the device asked for pair-verify, which this responder does not support; only new pairings are accepted")
+	}
+	return c.writePlain(object{"response": object{
+		"forRequestIdentifier": 0,
+		"_1": object{"handshake": object{"_0": object{
+			"wireProtocolVersion":                 responderWireProtocolVersion,
+			"minimumSupportedWireProtocolVersion": responderMinimumWireProtocol,
+			"deviceOptions": object{
+				"allowsPairSetup":                 true,
+				"allowsPinlessPairing":            false,
+				"allowsIncomingTunnelConnections": false,
+				"allowsUpgradeOfLockdownPairings": false,
+				"allowsSharingSensitiveInfo":      false,
+			},
+			"peerDeviceInfo": object{
+				"udid":                           "",
+				"deviceKVSIncludesSensitiveInfo": false,
+				"identifier":                     "",
+				"name":                           r.options.HostName,
+				"model":                          responderModel,
+			},
+		}}},
+	}})
+}
+
+func (r *Responder) pairSetup(state *acceptState, c *conn) (*Record, uint64, error) {
+	number, err := rand.Int(rand.Reader, big.NewInt(1000000))
+	if err != nil {
+		return nil, 0, err
+	}
+	pin := fmt.Sprintf("%06d", number.Int64())
+	server := newSRPServer(pin)
+	state.access.Lock()
+	if state.ctx.Err() != nil {
+		state.access.Unlock()
+		return nil, 0, state.ctx.Err()
+	}
+	state.attempt++
+	attempt := state.attempt
+	r.options.OnPIN(pin)
+	state.access.Unlock()
+	record, err := r.pairSetupSteps(c, server)
+	if err != nil {
+		return nil, attempt, E.Cause(err, "pair-setup")
+	}
+	return record, attempt, nil
+}
+
+func (r *Responder) pairSetupSteps(c *conn, server *srpServer) (*Record, error) {
+	write := func(items ...tlv8.Item) error {
+		return c.writePlain(pairingDataEvent("setupManualPairing", tlv8.Encode(items...), false, ""))
+	}
+	err := write(
+		tlv8.Item{Type: tlv8.TypeState, Value: []byte{2}},
+		tlv8.Item{Type: tlv8.TypeSalt, Value: server.salt},
+		tlv8.Item{Type: tlv8.TypePublicKey, Value: server.PublicKey()},
+	)
+	if err != nil {
+		return nil, E.Cause(err, "send M2")
+	}
+	m3, err := readSetup(c, 3)
+	if err != nil {
+		return nil, E.Cause(err, "read M3")
+	}
+	key, serverProof, err := server.Verify(m3[tlv8.TypePublicKey], m3[tlv8.TypeProof])
+	if err != nil {
+		write(
+			tlv8.Item{Type: tlv8.TypeState, Value: []byte{4}},
+			tlv8.Item{Type: tlv8.TypeError, Value: []byte{tlv8.ErrorAuthentication}},
+		)
+		return nil, err
+	}
+	err = write(
+		tlv8.Item{Type: tlv8.TypeState, Value: []byte{4}},
+		tlv8.Item{Type: tlv8.TypeProof, Value: serverProof},
+	)
+	if err != nil {
+		return nil, E.Cause(err, "send M4")
+	}
+	setupCipher, err := setupCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	m5, err := readSetup(c, 5)
+	if err != nil {
+		return nil, E.Cause(err, "read M5")
+	}
+	plaintext, err := setupCipher.Open(nil, pairingNonce("PS-Msg05"), m5[tlv8.TypeEncryptedData], nil)
+	if err != nil {
+		return nil, E.Cause(err, "decrypt M5")
+	}
+	record := *r.identity
+	err = parseDeviceIdentity(plaintext, &record, r.logger)
+	if err != nil {
+		return nil, E.Cause(err, "parse M5")
+	}
+	m6, err := identityTLV(&record, key, accessorySignLabels, r.options.HostName)
+	if err != nil {
+		return nil, err
+	}
+	err = write(
+		tlv8.Item{Type: tlv8.TypeEncryptedData, Value: setupCipher.Seal(nil, pairingNonce("PS-Msg06"), m6, nil)},
+		tlv8.Item{Type: tlv8.TypeState, Value: []byte{6}},
+	)
+	if err != nil {
+		return nil, E.Cause(err, "send M6")
+	}
+	r.logger.Info("paired with ", record.DeviceName, " (", record.DeviceUDID, ")")
+	return &record, nil
+}
+
+func (r *Responder) Close() error {
+	r.cancel()
+	r.drainAccess.Lock()
+	r.closed = true
+	for netConn := range r.draining {
+		netConn.Close()
+	}
+	r.drainAccess.Unlock()
+	return r.listener.Close()
+}

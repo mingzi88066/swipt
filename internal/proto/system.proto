@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package swipt;
+option go_package = "github.com/swipt-automation/swipt/internal/proto";
+
+import "google/protobuf/empty.proto";
+import "common.proto";
+
+service SystemService {
+  rpc GetInfo(google.protobuf.Empty) returns (GetInfoResponse);
+  rpc Shutdown(google.protobuf.Empty) returns (google.protobuf.Empty);
+}
+
+message GetInfoResponse {
+  string server_version = 1;
+  string device_name = 2;
+  string udid = 3;
+  DeviceConnection device_connection = 4;
+  string app_version = 5;
+  string app_build = 6;
+}

@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package swipt;
+option go_package = "github.com/swipt-automation/swipt/internal/proto";
+
+import "google/protobuf/timestamp.proto";
+import "common.proto";
+
+service LogService {
+  rpc ReadLogs(ReadLogsRequest) returns (stream ReadLogsResponse);
+}
+
+message ReadLogsRequest {
+  LogLevel level = 1;
+  string swiplet_id = 2;
+  google.protobuf.Timestamp since = 3;
+  uint32 tail = 4;
+  bool follow = 5;
+}
+
+message ReadLogsResponse {
+  LogEntry entry = 1;
+}

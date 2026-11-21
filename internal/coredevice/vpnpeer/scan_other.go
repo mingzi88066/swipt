@@ -1,0 +1,17 @@
+//go:build !darwin
+
+package vpnpeer
+
+import "net/netip"
+
+func scan() ([]tunnel, []netip.Addr, error) {
+	return nil, nil, nil
+}
+
+func onLocalNetwork(address netip.Addr) bool {
+	return false
+}
+
+func guestAddresses() []netip.Addr {
+	return nil
+}

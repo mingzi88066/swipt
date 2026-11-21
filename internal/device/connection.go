@@ -1,0 +1,1001 @@
+package device
+
+import (
+	"context"
+	"errors"
+	"net"
+	"net/netip"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
+	M "github.com/sagernet/sing/common/metadata"
+	"github.com/swipt-automation/swipt/internal/coredevice"
+	"github.com/swipt-automation/swipt/internal/coredevice/display"
+	"github.com/swipt-automation/swipt/internal/netwatch"
+	"github.com/swipt-automation/swipt/internal/rfb"
+	"github.com/swipt-automation/swipt/internal/version"
+)
+
+// The Developer Disk Image registers this RemoteService for /System/Developer/usr/libexec/dtremotedisplayd
+// (DDI 27B5028f, Library/LaunchDaemons/com.apple.coredevice.dtremotedisplayd.plist).
+const displayService = "com.apple.coredevice.displayservice"
+
+var (
+	errRerouted       = E.New("a new connection to the device would take a different route; reconnecting")
+	errRetryRequested = E.New("a new connection to the device was requested")
+)
+
+var retryDelays = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second}
+
+const (
+	stableConnection    = 30 * time.Second
+	defaultIdleTimeout  = 30 * time.Second
+	displayPollInterval = 5 * time.Second
+	displaySettleDelay  = time.Second
+	routeCheckInterval  = 5 * time.Second
+	failureRetry        = 10 * time.Second
+	connectPatience     = 10 * time.Second
+)
+
+type State int
+
+const (
+	StateStopped State = iota
+	StateConnecting
+	StatePreparing
+	StateRunning
+	StateFailed
+)
+
+func (s State) String() string {
+	switch s {
+	case StateStopped:
+		return "stopped"
+	case StateConnecting:
+		return "connecting"
+	case StatePreparing:
+		return "preparing"
+	case StateRunning:
+		return "running"
+	case StateFailed:
+		return "failed"
+	}
+	return "State(" + strconv.Itoa(int(s)) + ")"
+}
+
+type Observer interface {
+	StateChanged(state State, err error)
+	EnvironmentChanged(environment Environment)
+	ViewerConnected(session *rfb.ServerSession)
+	ViewerDisconnected(session *rfb.ServerSession, err error)
+	StreamingChanged(active bool)
+}
+
+type Options struct {
+	Name      string
+	Connect   func(ctx context.Context) (*coredevice.Device, error)
+	Reachable func(ctx context.Context) error
+	Logger    logger.ContextLogger
+	Observer  Observer
+
+	// BLSBacklightState: 0 off, 1 inactiveOn, 2 activeOn, 3 dimmed (BacklightServices
+	// 24A446, NSStringFromBLSBacklightState 0x22582161c, table 0x268a47640); -1 unavailable.
+	BacklightState func() int32
+
+	DiskImageDirectory        string
+	IdleTimeout               time.Duration
+	DeferAccessibilityRestart bool
+}
+
+type Settings struct {
+	AutoUnlockPasscode     string
+	AutoUnlockPasscodeType PasscodeType
+}
+
+type Connection struct {
+	options  Options
+	name     atomic.Pointer[string]
+	settings atomic.Pointer[Settings]
+	logger   logger.ContextLogger
+	notifier *notifier
+	streams  *streamManager
+	screens  *screenStreams
+	input    *hidQueue
+	clip     *clipboardBridge
+	phone    *Phone
+	viewing  *screenViewing
+
+	ctx         context.Context
+	cancel      context.CancelFunc
+	done        chan struct{}
+	retry       chan struct{}
+	demand      chan struct{}
+	displayWake chan struct{}
+	routeCheck  chan struct{}
+
+	access         sync.Mutex
+	started        bool
+	closed         bool
+	state          State
+	stateErr       error
+	closeErr       error
+	leases         int
+	idle           *time.Timer
+	endSession     context.CancelFunc
+	failure        error
+	failedAt       time.Time
+	unavailable    error
+	availability   chan struct{}
+	attemptErr     error
+	failedAttempts uint64
+	attached       *conn
+	detachedAt     time.Time
+	detachCause    error
+	attemptCancel  context.CancelCauseFunc
+	deviceWake     chan struct{}
+	screen         rfb.ServerScreen
+	display        display.DisplayInfo
+	videoProblem   error
+	rfb            *rfb.Server
+	daemonClean    bool
+	stalls         []time.Time
+
+	frontends sync.Mutex
+	listening bool
+	retired   bool
+	sharing   *frontend
+
+	environmentAccess sync.Mutex
+	images            diskImages
+	info              coredevice.DeviceInfo
+	language          string
+	timeZone          string
+}
+
+func New(options Options) *Connection {
+	if options.Logger == nil {
+		options.Logger = logger.NOP()
+	}
+	if options.IdleTimeout == 0 {
+		options.IdleTimeout = defaultIdleTimeout
+	}
+	s := &Connection{
+		options:      options,
+		logger:       options.Logger,
+		done:         make(chan struct{}),
+		retry:        make(chan struct{}, 1),
+		demand:       make(chan struct{}, 1),
+		displayWake:  make(chan struct{}, 1),
+		routeCheck:   make(chan struct{}, 1),
+		deviceWake:   make(chan struct{}),
+		availability: make(chan struct{}),
+		images:       diskImages{directory: options.DiskImageDirectory, logger: options.Logger},
+	}
+	s.name.Store(&options.Name)
+	s.settings.Store(&Settings{})
+	s.ctx, s.cancel = context.WithCancel(context.Background())
+	s.notifier = newNotifier()
+	s.streams = newStreamManager(s.logger, s.streamingChanged)
+	s.screens = newScreenStreams(s)
+	s.input = newHIDQueue(s, s.logger)
+	s.clip = newClipboardBridge(s, s.logger)
+	s.phone = &Phone{connection: s, logger: s.logger}
+	s.viewing = &screenViewing{connection: s}
+	return s
+}
+
+func (s *Connection) Start() error {
+	s.access.Lock()
+	if s.closed {
+		s.access.Unlock()
+		return E.New("device: closed")
+	}
+	if s.started {
+		s.access.Unlock()
+		return E.New("device: already started")
+	}
+	s.started = true
+	s.access.Unlock()
+	go s.run()
+	if !s.options.DeferAccessibilityRestart {
+		go func() {
+			_, release, err := s.acquire(s.ctx)
+			if err != nil {
+				s.logger.Debug(E.Cause(err, "connect to restart axauditd"))
+				return
+			}
+			release()
+		}()
+	}
+	return s.listen()
+}
+
+func (s *Connection) UpdateSettings(settings Settings) error {
+	err := validateAutoUnlock(settings)
+	if err != nil {
+		return err
+	}
+	s.settings.Store(&settings)
+	return nil
+}
+
+func (s *Connection) SetName(name string) {
+	s.name.Store(&name)
+}
+
+func (s *Connection) hold() (release func()) {
+	s.access.Lock()
+	s.leases++
+	if s.failure != nil && time.Since(s.failedAt) >= failureRetry {
+		s.failure = nil
+	}
+	if s.idle != nil {
+		s.idle.Stop()
+		s.idle = nil
+	}
+	if s.attached == nil && s.attemptErr != nil {
+		select {
+		case s.retry <- struct{}{}:
+		default:
+		}
+	}
+	s.access.Unlock()
+	s.wakeLoop()
+	var once sync.Once
+	return func() { once.Do(s.release) }
+}
+
+func (s *Connection) release() {
+	s.access.Lock()
+	defer s.access.Unlock()
+	s.leases--
+	if s.leases > 0 || s.closed {
+		return
+	}
+	var timer *time.Timer
+	timer = time.AfterFunc(s.options.IdleTimeout, func() {
+		s.access.Lock()
+		defer s.access.Unlock()
+		if s.idle != timer {
+			return
+		}
+		s.idle = nil
+		if s.endSession != nil {
+			s.logger.Debug("nothing uses the device connection; disconnecting")
+			s.endSession()
+		}
+	})
+	s.idle = timer
+}
+
+func (s *Connection) acquire(ctx context.Context) (*conn, func(), error) {
+	release := s.hold()
+	c, err := s.waitConn(ctx, false)
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	return c, release, nil
+}
+
+func (s *Connection) waitConn(ctx context.Context, persistent bool) (*conn, error) {
+	s.access.Lock()
+	attempts := s.failedAttempts
+	s.access.Unlock()
+	patience := time.NewTimer(connectPatience)
+	defer patience.Stop()
+	patient := true
+	for {
+		var err error
+		s.access.Lock()
+		c, wake := s.attached, s.deviceWake
+		if c != nil && (c.ctx.Err() != nil || c.device.Closed()) {
+			c = nil
+		}
+		switch {
+		case c != nil:
+		case s.closed:
+			err = E.Extend(ErrDisconnected, "the device connection is closing")
+		case s.unavailable != nil:
+			err = E.Cause1(ErrUnavailable, s.unavailable)
+		case s.failure != nil:
+			err = E.Cause1(ErrUnavailable, s.failure)
+		case !patient && s.attemptErr != nil && s.failedAttempts != attempts:
+			err = E.Cause1(ErrUnavailable, s.attemptErr)
+		}
+		s.access.Unlock()
+		if c != nil || err != nil {
+			return c, err
+		}
+		select {
+		case <-wake:
+		case <-patience.C:
+			patient = persistent
+		case <-ctx.Done():
+			s.access.Lock()
+			attempt := s.attemptErr
+			s.access.Unlock()
+			if attempt != nil {
+				return nil, E.Cause(ctx.Err(), "wait for the device, which did not connect: ", attempt)
+			}
+			return nil, E.Cause(ctx.Err(), "wait for the device")
+		case <-s.ctx.Done():
+			return nil, E.Extend(ErrDisconnected, "the device connection is closing")
+		}
+	}
+}
+
+func (s *Connection) SetUnavailable(err error) {
+	s.access.Lock()
+	if err == nil && s.unavailable == nil || err != nil && s.unavailable != nil && err.Error() == s.unavailable.Error() {
+		s.access.Unlock()
+		return
+	}
+	s.unavailable = err
+	close(s.availability)
+	s.availability = make(chan struct{})
+	if err != nil {
+		s.wakeWaitersLocked()
+	}
+	s.access.Unlock()
+	s.wakeLoop()
+}
+
+func (s *Connection) Retry() {
+	s.access.Lock()
+	cancel := s.attemptCancel
+	s.failure = nil
+	s.attemptErr = nil
+	select {
+	case s.retry <- struct{}{}:
+	default:
+	}
+	s.access.Unlock()
+	s.wakeLoop()
+	if cancel != nil {
+		cancel(errRetryRequested)
+	}
+}
+
+func (s *Connection) CheckRoute() {
+	select {
+	case s.routeCheck <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Connection) wakeLoop() {
+	select {
+	case s.demand <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Connection) wakeWaitersLocked() {
+	close(s.deviceWake)
+	s.deviceWake = make(chan struct{})
+}
+
+func (s *Connection) Close() error {
+	s.access.Lock()
+	if s.closed {
+		s.access.Unlock()
+		<-s.done
+		return s.closeErr
+	}
+	s.closed = true
+	started := s.started
+	if s.idle != nil {
+		s.idle.Stop()
+		s.idle = nil
+	}
+	s.access.Unlock()
+	s.cancel()
+	s.viewing.close()
+	s.closeFrontends()
+	if started {
+		<-s.done
+	} else {
+		close(s.done)
+	}
+	s.stopped(s.closeErr)
+	return s.closeErr
+}
+
+func (s *Connection) stopped(err error) {
+	s.access.Lock()
+	changed := s.state != StateStopped || !errors.Is(s.stateErr, err) || !errors.Is(err, s.stateErr)
+	s.state, s.stateErr = StateStopped, err
+	s.access.Unlock()
+	var last func()
+	if changed {
+		if err != nil {
+			s.logger.Info("state: ", StateStopped, ": ", err)
+		} else {
+			s.logger.Debug("state: ", StateStopped)
+		}
+		last = func() { s.options.Observer.StateChanged(StateStopped, err) }
+	}
+	s.notifier.close(last)
+}
+
+func (s *Connection) setStateLocked(state State, err error) {
+	if s.state == state && errors.Is(err, s.stateErr) && errors.Is(s.stateErr, err) {
+		return
+	}
+	s.state, s.stateErr = state, err
+	if err != nil {
+		s.logger.Info("state: ", state, ", ", ProblemOf(err), ": ", err)
+	} else {
+		s.logger.Debug("state: ", state)
+	}
+	s.notify(func(observer Observer) { observer.StateChanged(state, err) })
+}
+
+func (s *Connection) State() (State, error) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.state, s.stateErr
+}
+
+func (s *Connection) Name() string {
+	return *s.name.Load()
+}
+
+func (s *Connection) DeviceInfo() coredevice.DeviceInfo {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.info
+}
+
+func (s *Connection) notify(call func(Observer)) {
+	s.notifier.post(func() { call(s.options.Observer) })
+}
+
+func (s *Connection) syncEnvironment() {
+	if s.options.Observer == nil {
+		return
+	}
+	s.environmentAccess.Lock()
+	defer s.environmentAccess.Unlock()
+	s.options.Observer.EnvironmentChanged(s.phone.Environment())
+}
+
+func (s *Connection) streamingChanged(active bool) {
+	s.logger.Debug("device video running: ", active)
+	s.notify(func(observer Observer) { observer.StreamingChanged(active) })
+}
+
+func (s *Connection) run() {
+	defer close(s.done)
+	inputContext, stopInput := context.WithCancel(context.Background())
+	go s.input.run(inputContext)
+	defer func() {
+		stopInput()
+		<-s.input.done
+	}()
+	for {
+		var session context.Context
+		var end context.CancelFunc
+		s.access.Lock()
+		if !s.closed && s.leases > 0 && s.unavailable == nil && s.failure == nil {
+			session, end = context.WithCancel(s.ctx)
+			s.endSession = end
+		}
+		s.access.Unlock()
+		if session == nil {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-s.demand:
+			}
+			continue
+		}
+		s.serveSession(session)
+		s.access.Lock()
+		s.endSession = nil
+		s.access.Unlock()
+		end()
+		if s.ctx.Err() != nil {
+			return
+		}
+	}
+}
+
+func (s *Connection) serveSession(session context.Context) {
+	failures := 0
+	var lastErr error
+	for session.Err() == nil {
+		select {
+		case <-s.retry:
+		default:
+		}
+		s.access.Lock()
+		s.setStateLocked(StateConnecting, lastErr)
+		s.access.Unlock()
+		var connected time.Time
+		err := func() error {
+			ctx, cancel := context.WithCancelCause(session)
+			defer cancel(nil)
+			s.access.Lock()
+			s.attemptCancel = cancel
+			s.access.Unlock()
+			device, err := s.options.Connect(ctx)
+			s.access.Lock()
+			s.attemptCancel = nil
+			s.access.Unlock()
+			if err != nil {
+				if ctx.Err() != nil {
+					return context.Cause(ctx)
+				}
+				return err
+			}
+			if err := session.Err(); err != nil {
+				_ = device.Close()
+				return err
+			}
+			connected = time.Now()
+			return s.serveDevice(session, device)
+		}()
+		if session.Err() != nil {
+			break
+		}
+		switch {
+		case E.IsMulti(err, errRemounted, errRerouted, errRetryRequested):
+			lastErr = nil
+			failures = 0
+			continue
+		case stopping(err):
+			s.fail(err)
+			return
+		}
+		if connected.IsZero() {
+			s.logger.Debug("connect to the device: ", err)
+		} else {
+			s.logger.Info("device connection ended: ", err)
+		}
+		lastErr = err
+		s.access.Lock()
+		s.attemptErr = err
+		s.failedAttempts++
+		s.wakeWaitersLocked()
+		s.setStateLocked(StateConnecting, err)
+		s.access.Unlock()
+		if !connected.IsZero() && time.Since(connected) >= stableConnection {
+			failures = 0
+		}
+		if !s.wait(session, retryDelays[min(failures, len(retryDelays)-1)]) {
+			break
+		}
+		failures++
+	}
+	if s.ctx.Err() == nil {
+		s.access.Lock()
+		s.setStateLocked(StateStopped, nil)
+		s.access.Unlock()
+	}
+}
+
+func stopping(err error) bool {
+	switch ProblemOf(err) {
+	case ProblemPairingRejected, ProblemDeveloperModeOff, ProblemNoDiskImage, ProblemDiskImage,
+		ProblemListen, ProblemUnsupported, ProblemLoopbackAddress:
+		return true
+	}
+	return false
+}
+
+func (s *Connection) fail(err error) {
+	s.logger.Error("device connection stopped, ", ProblemOf(err), ": ", err)
+	s.access.Lock()
+	s.failure = err
+	s.failedAt = time.Now()
+	s.wakeWaitersLocked()
+	s.setStateLocked(StateFailed, err)
+	s.access.Unlock()
+}
+
+func (s *Connection) wait(session context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-session.Done():
+		return false
+	case <-s.retry:
+		return true
+	case <-timer.C:
+		return true
+	}
+}
+
+func (s *Connection) serveDevice(session context.Context, device *coredevice.Device) error {
+	defer device.Close()
+	owner, cancelOwner := context.WithCancelCause(context.Background())
+	defer cancelOwner(context.Canceled)
+	go func() {
+		select {
+		case <-device.Done():
+			cancelOwner(device.Err())
+		case <-owner.Done():
+		}
+	}()
+	info := device.Info()
+	s.logger.Info("device connected: ", info.UDID, ", ", info.ProductType, ", ", info.OSVersion, " (", info.BuildVersion, ")")
+	language, err := device.Language(session)
+	if err != nil {
+		s.logger.Warn(err)
+	}
+	timeZone, err := device.TimeZone(session)
+	if err != nil {
+		s.logger.Warn(err)
+	}
+	s.access.Lock()
+	s.info = info
+	if language != "" {
+		s.language = language
+	}
+	if timeZone != "" {
+		s.timeZone = timeZone
+	}
+	s.access.Unlock()
+	s.syncEnvironment()
+	s.setModel(info.ProductType)
+	if current, ok := version.Parse(info.OSVersion); ok && !current.AtLeast(version.Version{17, 4}) {
+		return newError(ProblemUnsupported, "iOS ", info.OSVersion, " cannot share its screen; it needs iOS 17.4 or later")
+	}
+	s.access.Lock()
+	s.setStateLocked(StatePreparing, nil)
+	s.access.Unlock()
+	err = s.images.prepare(session, device)
+	if err != nil {
+		return lostOr(device, err)
+	}
+	if !device.HasService(displayService) {
+		return newError(ProblemUnsupported, "the device does not offer ", displayService, " although its disk image is mounted")
+	}
+	displayClient := display.New(owner, device, s.logger)
+	state, err := displayClient.Displays(session)
+	if err != nil {
+		return lostOr(device, E.Cause(err, "read the device's displays"))
+	}
+	active, found := display.Active(state)
+	if !found {
+		return lostOr(device, E.New("the device lists no usable screen among its ", len(state), " displays"))
+	}
+	s.updateDisplay(active)
+	c := s.attach(session, device, displayClient, owner)
+	s.setRunning()
+	rerouted := s.watchRoute(session, device)
+	if err := s.detach(c); err != nil {
+		s.access.Lock()
+		closed := s.closed
+		if closed {
+			s.closeErr = err
+		}
+		s.access.Unlock()
+		if !closed && session.Err() != nil {
+			s.logger.Warn(E.Cause(err, "disconnect the device"))
+		}
+		return err
+	}
+	if err := session.Err(); err != nil {
+		return err
+	}
+	if rerouted != nil {
+		return rerouted
+	}
+	return &Error{Problem: ProblemNoTunnel, Err: E.Cause(device.Err(), "device connection lost")}
+}
+
+func (s *Connection) routeChanged(local, remote netip.AddrPort) bool {
+	conn, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(remote))
+	if err != nil {
+		return false
+	}
+	current := M.AddrPortFromNet(conn.LocalAddr()).Addr().Unmap()
+	_ = conn.Close()
+	if current != local.Addr().Unmap() {
+		s.logger.Debug("device route changed from ", local.Addr(), " to ", current)
+		return true
+	}
+	return false
+}
+
+func (s *Connection) watchRoute(session context.Context, device *coredevice.Device) error {
+	local, remote := device.TransportAddr()
+	routed := local.IsValid() && remote.IsValid()
+	watchCtx, stopWatch := context.WithCancel(session)
+	defer stopWatch()
+	var (
+		changes <-chan struct{}
+		ticker  *time.Ticker
+		tick    <-chan time.Time
+	)
+	defer func() {
+		if ticker != nil {
+			ticker.Stop()
+		}
+	}()
+	startTicker := func() {
+		if ticker == nil && s.options.Reachable == nil {
+			ticker = time.NewTicker(routeCheckInterval)
+			tick = ticker.C
+		}
+	}
+	if routed {
+		var err error
+		changes, err = netwatch.Watch(watchCtx)
+		if err != nil {
+			startTicker()
+		}
+		if s.routeChanged(local, remote) {
+			return errRerouted
+		}
+	}
+	for {
+		var requested bool
+		select {
+		case <-device.Done():
+			return nil
+		case <-session.Done():
+			return nil
+		case _, ok := <-changes:
+			if !ok {
+				changes = nil
+				startTicker()
+				continue
+			}
+		case <-tick:
+		case <-s.routeCheck:
+			requested = true
+		}
+		if routed && s.routeChanged(local, remote) {
+			return errRerouted
+		}
+		if requested && s.options.Reachable != nil {
+			err := s.options.Reachable(session)
+			if err != nil {
+				s.logger.Debug("device route lost: ", err)
+				return errRerouted
+			}
+		}
+	}
+}
+
+func lostOr(device *coredevice.Device, err error) error {
+	select {
+	case <-device.Done():
+		return &Error{Problem: ProblemNoTunnel, Err: E.Cause(device.Err(), "device connection lost")}
+	default:
+		return err
+	}
+}
+
+func (s *Connection) setRunning() {
+	s.access.Lock()
+	s.setStateLocked(StateRunning, s.videoProblem)
+	s.access.Unlock()
+}
+
+func (s *Connection) setVideoProblem(err error) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	changed := (err == nil) != (s.videoProblem == nil)
+	s.videoProblem = err
+	if s.state == StateRunning && (changed || err != nil) {
+		s.setStateLocked(StateRunning, err)
+	}
+}
+
+func (s *Connection) attach(session context.Context, device *coredevice.Device, displayClient *display.Client, owner context.Context) *conn {
+	c := newConn(s, session, device, displayClient, owner)
+	s.access.Lock()
+	s.attached = c
+	s.attemptErr = nil
+	s.videoProblem = nil
+	s.wakeWaitersLocked()
+	s.access.Unlock()
+	go s.input.prepareTouches(c)
+	go s.watchDisplay(c)
+	s.clip.update()
+	s.phone.attached(c)
+	return c
+}
+
+func (s *Connection) detach(c *conn) error {
+	s.access.Lock()
+	s.attached = nil
+	s.detachedAt = time.Now()
+	s.detachCause = c.device.Err()
+	s.wakeWaitersLocked()
+	s.access.Unlock()
+	c.cancel()
+	s.clip.update()
+	inputErr := s.input.forgetAndWait(c)
+	streamErr := s.streams.stopDevice(c.device)
+	return E.Errors(inputErr, streamErr, c.close())
+}
+
+func (s *Connection) currentConn() *conn {
+	s.access.Lock()
+	defer s.access.Unlock()
+	if s.attached != nil && s.attached.ctx.Err() == nil {
+		return s.attached
+	}
+	return nil
+}
+
+func (s *Connection) watchDisplay(c *conn) {
+	changed, relayed, cancel := c.darwin.watch()
+	defer cancel()
+	_ = c.darwin.waitReady(c.ctx)
+	settle := time.NewTimer(displaySettleDelay)
+	settle.Stop()
+	defer settle.Stop()
+	fallback := time.NewTimer(displayPollInterval)
+	fallback.Stop()
+	defer fallback.Stop()
+	var settleC, fallbackC <-chan time.Time
+	for {
+		if !relayed() && fallbackC == nil {
+			fallback.Reset(displayPollInterval)
+			fallbackC = fallback.C
+		}
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-s.displayWake:
+			settle.Reset(displaySettleDelay)
+			settleC = settle.C
+		case <-settleC:
+			settleC = nil
+		case <-changed:
+			continue
+		case <-fallbackC:
+			fallbackC = nil
+			if !s.streams.showing() {
+				continue
+			}
+		}
+		if _, err := c.activeDisplay(c.ctx); err != nil && c.ctx.Err() == nil {
+			s.logger.Debug(err)
+		}
+	}
+}
+
+func (s *Connection) checkDisplay() {
+	select {
+	case s.displayWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Connection) updateDisplay(info display.DisplayInfo) {
+	s.access.Lock()
+	previous := s.display
+	s.display = info
+	changed := previous.Width != info.Width || previous.Height != info.Height
+	if changed {
+		shown := screenInfo(info)
+		screen := rfb.ServerScreen{Width: shown.Width, Height: shown.Height, Scale: shown.Scale, Model: s.screen.Model}
+		changed = screen != s.screen
+		s.screen = screen
+	}
+	s.access.Unlock()
+	if previous.ID != info.ID && previous.ID != 0 {
+		s.logger.Info("the screen moved from display ", previous.ID, " to display ", info.ID)
+		s.streams.follow(info.ID)
+	}
+	if previous.CurrentOrientation != info.CurrentOrientation && previous.CurrentOrientation != "" {
+		s.logger.Debug("screen orientation: ", info.CurrentOrientation, ", ", info.Width, "x", info.Height)
+	}
+	if changed {
+		s.logger.Debug("screen size changed: ", info.Width, "x", info.Height)
+		s.screenChanged()
+	}
+}
+
+func (s *Connection) displayID() int {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.display.ID
+}
+
+func (s *Connection) setModel(model string) {
+	s.access.Lock()
+	changed := s.screen.Model != model
+	s.screen.Model = model
+	s.access.Unlock()
+	if changed {
+		s.screenChanged()
+	}
+}
+
+func (s *Connection) videoSize(width, height int) {
+	if width <= 0 || height <= 0 {
+		return
+	}
+	s.access.Lock()
+	changed := s.screen.Width != width || s.screen.Height != height
+	s.screen.Width, s.screen.Height = width, height
+	s.access.Unlock()
+	if changed {
+		s.logger.Debug("the video's size differs from the screen's: ", width, "x", height)
+		go s.screenChanged()
+	}
+}
+
+func (s *Connection) geometry() screenGeometry {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return screenGeometry{
+		Width:   s.screen.Width,
+		Height:  s.screen.Height,
+		Scale:   s.screen.Scale,
+		Density: s.screen.Density(),
+		Turns:   touchTurns(s.display, s.screen.Width, s.screen.Height),
+	}
+}
+
+type notifier struct {
+	access sync.Mutex
+	queue  []func()
+	wake   chan struct{}
+	closed bool
+}
+
+func newNotifier() *notifier {
+	n := &notifier{wake: make(chan struct{}, 1)}
+	go n.run()
+	return n
+}
+
+func (n *notifier) post(call func()) {
+	n.access.Lock()
+	if n.closed {
+		n.access.Unlock()
+		return
+	}
+	n.queue = append(n.queue, call)
+	n.access.Unlock()
+	select {
+	case n.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (n *notifier) run() {
+	for {
+		n.access.Lock()
+		queue := n.queue
+		n.queue = nil
+		closed := n.closed
+		n.access.Unlock()
+		for _, call := range queue {
+			call()
+		}
+		if closed && len(queue) == 0 {
+			return
+		}
+		if len(queue) == 0 {
+			<-n.wake
+		}
+	}
+}
+
+func (n *notifier) close(last func()) {
+	n.access.Lock()
+	if last != nil {
+		n.queue = append(n.queue, last)
+	}
+	n.closed = true
+	n.access.Unlock()
+	select {
+	case n.wake <- struct{}{}:
+	default:
+	}
+}

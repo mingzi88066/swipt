@@ -1,0 +1,309 @@
+diff --git a/Package.swift b/Package.swift
+new file mode 100644
+index 0000000000000000000000000000000000000000..00a11631b6573c3bdd4abc3e801a853f17cf8601
+--- /dev/null
++++ b/Package.swift
+@@ -0,0 +1,30 @@
++// swift-tools-version: 6.2
++import PackageDescription
++
++let package = Package(
++  name: "expo-ui",
++  platforms: [
++    .iOS("16.4"),
++    .tvOS("16.4"),
++    .macOS("13.4"),
++  ],
++  products: [
++    .library(name: "ExpoUI", targets: ["ExpoUI", "ExpoUIObjC"])
++  ],
++  dependencies: [],
++  targets: [
++    .target(
++      name: "ExpoUI",
++      dependencies: ["ExpoUIObjC"],
++      path: "ios",
++      exclude: ["ExpoUI.podspec", "ExpoUITouchHandlerHelper.h", "ExpoUITouchHandlerHelper.mm"]
++    ),
++    .target(
++      name: "ExpoUIObjC",
++      dependencies: [],
++      path: "ios",
++      sources: ["ExpoUITouchHandlerHelper.mm"],
++      publicHeadersPath: "."
++    ),
++  ]
++)
+diff --git a/build/State/index.fx.js b/build/State/index.fx.js
+index bba036c2fc54e9300f41a151117133722562093b..cd40391aa179590afaac6c7c9b3f1c478f1c2155 100644
+--- a/build/State/index.fx.js
++++ b/build/State/index.fx.js
+@@ -1,64 +1,3 @@
+-// Side effect file to load shared object support in worklets
+-import { installOnUIRuntime } from 'expo';
+-import { worklets } from './optionalWorklets';
+-import { EXPO_SHARED_OBJECT_ID_KEY, isExpoUISharedObject } from './sharedObjectBrand';
+-let _serializerRegistered = false;
+-/**
+- * Registers a custom serializer so SharedObjects automatically work in worklets.
+- * Call it after `installOnUIRuntime()`.
+- */ function registerSharedObjectSerializer() {
+-    if (_serializerRegistered) {
+-        return;
+-    }
+-    if (!worklets) {
+-        return;
+-    }
+-    _serializerRegistered = true;
+-    const { registerCustomSerializable } = worklets;
+-    registerCustomSerializable({
+-        name: 'ExpoSharedObject',
+-        determine: (value)=>{
+-            'worklet';
+-            return isExpoUISharedObject(value);
+-        },
+-        pack: (value)=>{
+-            'worklet';
+-            return {
+-                objectId: value[EXPO_SHARED_OBJECT_ID_KEY]
+-            };
+-        },
+-        unpack: (packed)=>{
+-            'worklet';
+-            const obj = globalThis.expo.SharedObject.__resolveInWorklet(packed.objectId);
+-            // Define .value plus the get/set accessors if the object has
+-            // getValue/setValue (e.g. ObservableState)
+-            if (typeof obj.getValue === 'function' && typeof obj.setValue === 'function') {
+-                Object.defineProperty(obj, 'value', {
+-                    get () {
+-                        return obj.getValue();
+-                    },
+-                    set (v) {
+-                        obj.setValue({
+-                            value: v
+-                        });
+-                    }
+-                });
+-                obj.get = ()=>obj.getValue();
+-                obj.set = (v)=>obj.setValue({
+-                        value: v
+-                    });
+-            }
+-            return obj;
+-        }
+-    });
+-}
+-try {
+-    if (worklets) {
+-        installOnUIRuntime(worklets.getUIRuntimeHolder());
+-        registerSharedObjectSerializer();
+-    }
+-} catch  {
+-// Fail silently as worklet support is currently optional in Expo UI
+-}
++export { };
+ 
+ //# sourceMappingURL=index.fx.js.map
+diff --git a/build/State/index.js b/build/State/index.js
+index 1dc9d6bc526f13128fd8b4494e3f8cb03da64465..d911605d12ce494176b1f35686dd0d410e0f0549 100644
+--- a/build/State/index.js
++++ b/build/State/index.js
+@@ -6,7 +6,7 @@ import './index.fx';
+ export { useNativeState } from './useNativeState';
+ export { useWorkletProp } from './useWorkletProp';
+ export { useWorkletCallback } from './useWorkletCallback';
+-export { worklets } from './optionalWorklets';
++export { isWorkletFunction, worklets } from './optionalWorklets';
+ export { getStateId } from './utils';
+ 
+ //# sourceMappingURL=index.js.map
+diff --git a/build/State/optionalWorklets.js b/build/State/optionalWorklets.js
+index 634258dbc9fec013d75953696902a7a2de15634d..69a4c4a1fac5a5edd225a4d1965b6faa4ceecc03 100644
+--- a/build/State/optionalWorklets.js
++++ b/build/State/optionalWorklets.js
+@@ -1,11 +1,82 @@
+ /**
+  * A re-export of `react-native-worklets` that supports optional dependency.
+- */ let worklets;
+-try {
+-    worklets = require('react-native-worklets');
+-} catch  {
+-// Fail silently as worklet support is currently optional in Expo UI
++ * Loading `react-native-worklets` starts its UI runtime: react-native-worklets 0.13.0,
++ * src/index.ts:10 and src/WorkletsModule/NativeWorklets.native.ts:37,428.
++ */ const { installOnUIRuntime } = require('expo');
++const { EXPO_SHARED_OBJECT_ID_KEY, isExpoUISharedObject } = require('./sharedObjectBrand');
++let worklets;
++let loaded = false;
++/**
++ * Registers a custom serializer so SharedObjects automatically work in worklets.
++ * Call it after `installOnUIRuntime()`.
++ */ function registerSharedObjectSerializer() {
++    const { registerCustomSerializable } = worklets;
++    registerCustomSerializable({
++        name: 'ExpoSharedObject',
++        determine: (value)=>{
++            'worklet';
++            return isExpoUISharedObject(value);
++        },
++        pack: (value)=>{
++            'worklet';
++            return {
++                objectId: value[EXPO_SHARED_OBJECT_ID_KEY]
++            };
++        },
++        unpack: (packed)=>{
++            'worklet';
++            const obj = globalThis.expo.SharedObject.__resolveInWorklet(packed.objectId);
++            // Define .value plus the get/set accessors if the object has
++            // getValue/setValue (e.g. ObservableState)
++            if (typeof obj.getValue === 'function' && typeof obj.setValue === 'function') {
++                Object.defineProperty(obj, 'value', {
++                    get () {
++                        return obj.getValue();
++                    },
++                    set (v) {
++                        obj.setValue({
++                            value: v
++                        });
++                    }
++                });
++                obj.get = ()=>obj.getValue();
++                obj.set = (v)=>obj.setValue({
++                        value: v
++                    });
++            }
++            return obj;
++        }
++    });
+ }
+-export { worklets };
++Object.defineProperty(exports, '__esModule', {
++    value: true
++});
++Object.defineProperty(exports, 'worklets', {
++    enumerable: true,
++    get () {
++        if (!loaded) {
++            loaded = true;
++            try {
++                worklets = require('react-native-worklets');
++            } catch  {
++            // Fail silently as worklet support is currently optional in Expo UI
++            }
++            try {
++                if (worklets) {
++                    installOnUIRuntime(worklets.getUIRuntimeHolder());
++                    registerSharedObjectSerializer();
++                }
++            } catch  {
++            // Fail silently as worklet support is currently optional in Expo UI
++            }
++        }
++        return worklets;
++    }
++});
++/**
++ * The check of `isWorkletFunction` in react-native-worklets 0.13.0, src/workletFunction.ts:36-40.
++ */ exports.isWorkletFunction = function isWorkletFunction(value) {
++    return typeof value === 'function' && !!value.__workletHash;
++};
+ 
+ //# sourceMappingURL=optionalWorklets.js.map
+diff --git a/build/community/pager-view/PagerView.ios.js b/build/community/pager-view/PagerView.ios.js
+index d0a776e74cff480825e8bce7eeb036bfa1b0aeb3..2549b024bd64b657f299b6699075404d61883a9a 100644
+--- a/build/community/pager-view/PagerView.ios.js
++++ b/build/community/pager-view/PagerView.ios.js
+@@ -1,7 +1,7 @@
+ import { jsx as _jsx } from "react/jsx-runtime";
+ import { Children, isValidElement, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react';
+ import { Platform, StyleSheet, View } from 'react-native';
+-import { useNativeState, worklets } from '../../State';
++import { isWorkletFunction, useNativeState, worklets } from '../../State';
+ import { Group } from '../../swift-ui/Group';
+ import { Host } from '../../swift-ui/Host';
+ import { LazyHStack } from '../../swift-ui/LazyHStack';
+@@ -217,7 +217,7 @@ function geometryToPageScroll(geometry) {
+ // Mirrors the worklet-ness of the user's callback so the per-frame mapping
+ // stays on the UI runtime when the user is also on it.
+ function buildHandleScrollGeometry(userOnPageScroll) {
+-    if (worklets?.isWorkletFunction?.(userOnPageScroll)) {
++    if (isWorkletFunction(userOnPageScroll)) {
+         return (geometry)=>{
+             'worklet';
+             if (geometry.containerWidth <= 0) return;
+diff --git a/build/swift-ui/SecureField/index.js b/build/swift-ui/SecureField/index.js
+index 04eccad0f366794668bdd22676e4d397529379d1..b6ef2d300dc74dbc94c3a9230af2cccbcccbe418 100644
+--- a/build/swift-ui/SecureField/index.js
++++ b/build/swift-ui/SecureField/index.js
+@@ -1,6 +1,6 @@
+ import { jsx as _jsx } from "react/jsx-runtime";
+ import { requireNativeView } from 'expo';
+-import { getStateId, useWorkletProp, worklets } from '../../State';
++import { getStateId, isWorkletFunction, useWorkletProp } from '../../State';
+ import { useHostedTextInput } from '../../keyboard';
+ import { Slot } from '../SlotView';
+ import { createViewModifierEventListener } from '../modifiers/utils';
+@@ -15,7 +15,7 @@ function Placeholder({ children }) {
+  * Renders a SwiftUI `SecureField` for password input.
+  */ export function SecureField(props) {
+     const { text, onTextChange, onFocusChange, modifiers, ref, ...restProps } = props;
+-    const isWorklet = !!onTextChange && !!worklets?.isWorkletFunction?.(onTextChange);
++    const isWorklet = !!onTextChange && !!isWorkletFunction(onTextChange);
+     const workletCallback = useWorkletProp(isWorklet ? onTextChange : undefined, 'onTextChange');
+     // `blurOnUnmount`: a field left first responder while its row is removed makes UIKit
+     // assert ("refused to resign"); native teardown hooks run too late to clear SwiftUI's
+diff --git a/build/swift-ui/TextField/index.js b/build/swift-ui/TextField/index.js
+index 6517681d87e6116bc19f7ff737e09dd60120a735..efefd54879ae50c3220abd1861114b9afd6fcbce 100644
+--- a/build/swift-ui/TextField/index.js
++++ b/build/swift-ui/TextField/index.js
+@@ -1,6 +1,6 @@
+ import { jsx as _jsx } from "react/jsx-runtime";
+ import { requireNativeView } from 'expo';
+-import { getStateId, useWorkletProp, worklets } from '../../State';
++import { getStateId, isWorkletFunction, useWorkletProp } from '../../State';
+ import { useHostedTextInput } from '../../keyboard';
+ import { Slot } from '../SlotView';
+ import { createViewModifierEventListener } from '../modifiers/utils';
+@@ -15,7 +15,7 @@ function Placeholder({ children }) {
+  * Renders a SwiftUI `TextField`.
+  */ export function TextField(props) {
+     const { text, selection, onTextChange, onFocusChange, onSelectionChange, modifiers, ref, ...restProps } = props;
+-    const isWorklet = !!onTextChange && !!worklets?.isWorkletFunction?.(onTextChange);
++    const isWorklet = !!onTextChange && !!isWorkletFunction(onTextChange);
+     const workletCallback = useWorkletProp(isWorklet ? onTextChange : undefined, 'onTextChange');
+     // `blurOnUnmount`: a field left first responder while its row is removed makes UIKit
+     // assert ("refused to resign"); native teardown hooks run too late to clear SwiftUI's
+diff --git a/build/swift-ui/modifiers/scrollObservation.js b/build/swift-ui/modifiers/scrollObservation.js
+index a318eb36801683b5cc06e9f849315f780bbee24f..cfca3b279f7cc1cc452689359410b3604e35d2f6 100644
+--- a/build/swift-ui/modifiers/scrollObservation.js
++++ b/build/swift-ui/modifiers/scrollObservation.js
+@@ -1,4 +1,4 @@
+-import { getStateId, useWorkletProp, worklets } from '../../State';
++import { getStateId, isWorkletFunction, useWorkletProp } from '../../State';
+ import { createModifier, createModifierWithEventListener } from './createModifier';
+ /**
+  * Fires when the scroll geometry changes — i.e., on every scroll update and
+@@ -33,7 +33,7 @@ import { createModifier, createModifierWithEventListener } from './createModifie
+  * <ScrollView modifiers={[geometryModifier]} />
+  * ```
+  */ export function useScrollGeometryChange(callback) {
+-    const isWorklet = !!callback && !!worklets?.isWorkletFunction?.(callback);
++    const isWorklet = !!callback && !!isWorkletFunction(callback);
+     const workletCallback = useWorkletProp(isWorklet ? callback : undefined, 'onScrollGeometryChange');
+     if (!callback) {
+         return null;
+diff --git a/ios/RNHostView.swift b/ios/RNHostView.swift
+index f2d5a184732bc9027e801f76d97654d4b83501af..52a0964e4f0ceec7fc48454034979beb0c311834 100644
+--- a/ios/RNHostView.swift
++++ b/ios/RNHostView.swift
+@@ -2,6 +2,9 @@
+ 
+ import SwiftUI
+ import ExpoModulesCore
++#if canImport(ExpoUIObjC)
++import ExpoUIObjC
++#endif
+ 
+ internal final class RNHostViewProps: ExpoSwiftUI.ViewProps {
+   @Field var matchContentsHorizontal: Bool = false

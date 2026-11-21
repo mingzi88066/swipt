@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package swipt;
+option go_package = "github.com/swipt-automation/swipt/internal/proto";
+
+import "google/protobuf/empty.proto";
+import "common.proto";
+
+service REPLService {
+  rpc Execute(ExecuteRequest) returns (stream ExecuteResponse);
+  rpc Reset(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc GetDeclarations(google.protobuf.Empty) returns (GetDeclarationsResponse);
+}
+
+message ExecuteRequest {
+  string code = 1;
+  uint32 timeout_ms = 2;
+  repeated string args = 3;
+  bool program = 4;
+}
+
+message ConsoleOutput {
+  LogLevel level = 1;
+  string text = 2;
+}
+
+message ScriptValue {
+  string json = 1;
+  string text = 2;
+}
+
+message ExecuteResponse {
+  oneof part {
+    ConsoleOutput console = 1;
+    ScriptValue value = 2;
+    bytes image = 3;
+    ScriptError error = 4;
+  }
+}
+
+message GetDeclarationsResponse {
+  string typescript = 1;
+}

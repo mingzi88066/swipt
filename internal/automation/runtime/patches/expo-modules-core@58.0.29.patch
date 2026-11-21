@@ -1,0 +1,118 @@
+diff --git a/build/NativeViewManagerAdapter.native.js b/build/NativeViewManagerAdapter.native.js
+index 6273fada87c1f5ac025c119ab63081ba8af189c2..61baafbf3a9501fb2e3c97b044f104e4b65d5ed0 100644
+--- a/build/NativeViewManagerAdapter.native.js
++++ b/build/NativeViewManagerAdapter.native.js
+@@ -19,7 +19,7 @@ import { requireNativeModule } from './requireNativeModule';
+ /**
+  * Requires a React Native component using the static view config from an Expo module.
+  */ function requireNativeComponent(moduleName, viewName) {
+-    const appIdentifier = globalThis.expo?.['__expo_app_identifier__'] ?? '';
++    const appIdentifier = globalThis.expo?.['__expo_view_identifier__'] ?? globalThis.expo?.['__expo_app_identifier__'] ?? '';
+     const viewNameSuffix = appIdentifier ? `_${appIdentifier}` : '';
+     const nativeViewName = viewName ? `ViewManagerAdapter_${moduleName}_${viewName}${viewNameSuffix}` : `ViewManagerAdapter_${moduleName}${viewNameSuffix}`;
+     return NativeComponentRegistry.get(nativeViewName, ()=>{
+diff --git a/ios/Core/AppContext.swift b/ios/Core/AppContext.swift
+index 8a8685bece51b5e0d481aacb28fd700a8e897145..8cb66638cc40f4a395d3ed4ecb119daeffc7533c 100644
+--- a/ios/Core/AppContext.swift
++++ b/ios/Core/AppContext.swift
+@@ -147,6 +147,23 @@ public class AppContext: NSObject, EXAppContextProtocol, @unchecked Sendable {
+     return String(index)
+   }
+ 
++  @objc
++  public var viewIdentifier: String? {
++    return reusableViewIdentifier.withLock { $0?.string } ?? appIdentifier
++  }
++
++  private let reusableViewIdentifier = Mutex<ReusableViewIdentifier?>(nil)
++
++  @objc
++  @discardableResult
++  public func useReusableViewIdentifier() -> String {
++    return reusableViewIdentifier.withLock { identifier in
++      let reusable = identifier ?? ReusableViewIdentifier()
++      identifier = reusable
++      return reusable.string
++    }
++  }
++
+   /**
+    Code signing entitlements for code signing
+    */
+@@ -900,3 +917,28 @@ public typealias AppContextLostException = Exceptions.AppContextLost
+ // Deprecated since v1.0.0
+ @available(*, deprecated, renamed: "Exceptions.RuntimeLost")
+ public typealias RuntimeLostException = Exceptions.RuntimeLost
++
++private final class ReusableViewIdentifier: Sendable {
++  private static let state = Mutex<(free: IndexSet, count: Int)>((free: IndexSet(), count: 0))
++
++  let index: Int
++  let string: String
++
++  init() {
++    index = Self.state.withLock { state in
++      if let index = state.free.first {
++        state.free.remove(index)
++        return index
++      }
++      state.count += 1
++      return state.count
++    }
++    string = String(index)
++  }
++
++  deinit {
++    Self.state.withLock { state in
++      _ = state.free.insert(index)
++    }
++  }
++}
+diff --git a/ios/Fabric/ExpoFabricViewObjC.mm b/ios/Fabric/ExpoFabricViewObjC.mm
+index 370015ff59ee6dead8aeb8f299822b9f4d7cb696..21e82a76026103bd8381c7f45fa920000bd5cce0 100644
+--- a/ios/Fabric/ExpoFabricViewObjC.mm
++++ b/ios/Fabric/ExpoFabricViewObjC.mm
+@@ -458,7 +458,7 @@ + (void)registerComponent:(nonnull id)viewModule appContext:(nonnull id<EXAppCon
+   }
+ 
+   Class wrappedViewModuleClass = nil;
+-  NSString *appId = [appContext appIdentifier];
++  NSString *appId = [appContext viewIdentifier];
+ 
+   if (![viewModuleWrapperClass respondsToSelector:createWrapperSelector]) {
+     NSLog(@"[ExpoFabricViewObjC] Error: EXViewModuleWrapper does not respond "
+diff --git a/ios/Protocols/EXAppContextProtocol.h b/ios/Protocols/EXAppContextProtocol.h
+index d0c1c80e9889b1d86334e2d2d85998cf5dcaa20b..529c685de81fcb2bed1cb203451f0ba259107f05 100644
+--- a/ios/Protocols/EXAppContextProtocol.h
++++ b/ios/Protocols/EXAppContextProtocol.h
+@@ -30,6 +30,8 @@ typedef void (NS_SWIFT_SENDABLE ^EXPromiseRejectBlock)(NSString * _Nullable code
+  */
+ @property(nonatomic, readonly, nullable) NSString *appIdentifier;
+ 
++@property(nonatomic, readonly, nullable) NSString *viewIdentifier;
++
+ #pragma mark - Module Management
+ 
+ /**
+diff --git a/src/NativeViewManagerAdapter.native.tsx b/src/NativeViewManagerAdapter.native.tsx
+index a42ad11d6eee6dc6716c0b4cb9176c3a7ac1a001..b41475f5e0589119c52f604f46385c534cb4aead 100644
+--- a/src/NativeViewManagerAdapter.native.tsx
++++ b/src/NativeViewManagerAdapter.native.tsx
+@@ -33,6 +33,7 @@ declare namespace globalThis {
+     | undefined
+     | {
+         __expo_app_identifier__?: string;
++        __expo_view_identifier__?: string;
+         getViewConfig(
+           moduleName: string,
+           viewName?: string
+@@ -50,7 +51,8 @@ function requireNativeComponent<Props extends object>(
+   moduleName: string,
+   viewName?: string
+ ): HostComponent<Props> {
+-  const appIdentifier = globalThis.expo?.['__expo_app_identifier__'] ?? '';
++  const appIdentifier =
++    globalThis.expo?.['__expo_view_identifier__'] ?? globalThis.expo?.['__expo_app_identifier__'] ?? '';
+   const viewNameSuffix = appIdentifier ? `_${appIdentifier}` : '';
+ 
+   const nativeViewName = viewName

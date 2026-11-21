@@ -1,0 +1,302 @@
+package device
+
+import (
+	"context"
+	"slices"
+	"sync"
+	"time"
+
+	E "github.com/sagernet/sing/common/exceptions"
+)
+
+// The remote notification proxy relays any Darwin notification it is asked to
+// observe, such as com.apple.system.config.network_change (iOS 27.2 24B115).
+const notificationProxyService = "com.apple.mobile.notification_proxy.shim.remote"
+
+const (
+	displayStatus  = "com.apple.iokit.hid.displayStatus"
+	blankedScreen  = "com.apple.springboard.hasBlankedScreen"
+	screenDimmed   = "com.apple.springboardservices.eventobserver.internalSBSEventObserverEventDimmed"
+	screenUndimmed = "com.apple.springboardservices.eventobserver.internalSBSEventObserverEventUndimmed"
+)
+
+var stateNotifications = []string{
+	"com.apple.mobile.keybagd.lock_status",
+	"com.apple.springboard.lockstate",
+	blankedScreen,
+	displayStatus,
+	screenDimmed,
+	screenUndimmed,
+}
+
+const displayPoll = time.Second
+
+type darwinNotifications struct {
+	conn *conn
+
+	access   sync.Mutex
+	watchers map[chan struct{}]struct{}
+	active   *notificationRelay
+	failedAt time.Time
+
+	displayPosted   uint64
+	displayFollowed uint64
+	blanked         bool
+	undimming       bool
+}
+
+type notificationRelay struct {
+	ctx       context.Context
+	stop      context.CancelFunc
+	ready     chan struct{}
+	readyOnce sync.Once
+	stopped   chan struct{}
+	relayed   bool
+	err       error
+}
+
+func newDarwinNotifications(c *conn) *darwinNotifications {
+	return &darwinNotifications{conn: c, watchers: make(map[chan struct{}]struct{})}
+}
+
+func (d *darwinNotifications) startLocked(force bool) *notificationRelay {
+	if d.active == nil && len(d.watchers) > 0 && d.conn.ctx.Err() == nil && (force || d.failedAt.IsZero() || time.Since(d.failedAt) >= displayPoll) {
+		ctx, stop := context.WithCancel(d.conn.ctx)
+		d.active = &notificationRelay{ctx: ctx, stop: stop, ready: make(chan struct{}), stopped: make(chan struct{})}
+		go d.observe(d.active)
+	}
+	return d.active
+}
+
+func (d *darwinNotifications) isActive() bool {
+	d.access.Lock()
+	defer d.access.Unlock()
+	return d.active != nil && d.active.relayed
+}
+
+func (d *darwinNotifications) watch() (changed <-chan struct{}, relayed func() bool, cancel func()) {
+	signal := make(chan struct{}, 1)
+	d.access.Lock()
+	d.watchers[signal] = struct{}{}
+	d.startLocked(true)
+	d.access.Unlock()
+	var once sync.Once
+	return signal, func() bool {
+			d.access.Lock()
+			defer d.access.Unlock()
+			d.startLocked(false)
+			return d.active != nil && d.active.relayed
+		}, func() {
+			once.Do(func() {
+				d.access.Lock()
+				defer d.access.Unlock()
+				delete(d.watchers, signal)
+				if len(d.watchers) == 0 && d.active != nil {
+					d.active.stop()
+					d.active = nil
+				}
+			})
+		}
+}
+
+func (d *darwinNotifications) waitReady(ctx context.Context) error {
+	d.access.Lock()
+	active := d.startLocked(true)
+	d.access.Unlock()
+	if active == nil {
+		if err := d.conn.ctx.Err(); err != nil {
+			return err
+		}
+		return E.New("the device's notification observation is not running")
+	}
+	select {
+	case <-active.ready:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-active.ctx.Done():
+		return active.ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	d.access.Lock()
+	defer d.access.Unlock()
+	if active.err != nil {
+		return active.err
+	}
+	if d.active != active {
+		return context.Canceled
+	}
+	return active.ctx.Err()
+}
+
+func (d *darwinNotifications) notifyLocked() {
+	for signal := range d.watchers {
+		select {
+		case signal <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (d *darwinNotifications) observe(active *notificationRelay) {
+	defer close(active.stopped)
+	defer active.stop()
+	err := d.relay(active)
+	d.access.Lock()
+	active.err = err
+	active.relayed = false
+	if err != nil && active.ctx.Err() == nil {
+		d.failedAt = time.Now()
+	}
+	if d.active == active {
+		d.active = nil
+	}
+	active.readyOnce.Do(func() { close(active.ready) })
+	d.notifyLocked()
+	d.access.Unlock()
+	if d.conn.ctx.Err() == nil && !d.isActive() {
+		d.conn.connection.viewing.close()
+	}
+	if err != nil && active.ctx.Err() == nil {
+		d.conn.logger.Debug(E.Cause(err, "observe the device's lock and display notifications"))
+	}
+}
+
+func (d *darwinNotifications) relay(active *notificationRelay) error {
+	ctx := active.ctx
+	conn, err := d.conn.device.DialShim(ctx, notificationProxyService)
+	if err != nil {
+		return err
+	}
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
+	defer conn.Close()
+	for _, name := range append(slices.Clone(stateNotifications), substantialTransition) {
+		if err = conn.Send(map[string]any{"Command": "ObserveNotification", "Name": name}); err != nil {
+			return E.Cause(err, "observe ", name)
+		}
+	}
+	d.access.Lock()
+	active.relayed = ctx.Err() == nil
+	active.readyOnce.Do(func() { close(active.ready) })
+	d.notifyLocked()
+	d.access.Unlock()
+	for {
+		message, err := conn.Receive()
+		if err != nil {
+			return err
+		}
+		switch message["Command"] {
+		case "RelayNotification":
+			d.access.Lock()
+			if d.active != active || ctx.Err() != nil {
+				d.access.Unlock()
+				return context.Canceled
+			}
+			name, _ := message["Name"].(string)
+			// When the display went off, EventDimmed and
+			// com.apple.springboard.hasBlankedScreen came after
+			// com.apple.iokit.hid.displayStatus. When it came back on, EventUndimmed
+			// came first, then displayStatus and then hasBlankedScreen, and until then
+			// SpringBoard took key presses as requests to wake (iOS 27.3 24C5037i).
+			switch name {
+			case displayStatus:
+				d.displayPosted++
+				d.conn.connection.checkDisplay()
+			case screenDimmed:
+				d.blanked, d.undimming = true, false
+			case screenUndimmed:
+				d.undimming = true
+				// Folding or unfolding an iPhone Duo posted EventUndimmed when the
+				// transition began and again once the other display was lit, and no
+				// displayStatus (iOS 27.2 24B91020).
+				d.conn.connection.checkDisplay()
+			case blankedScreen:
+				d.displayFollowed = d.displayPosted
+				if d.undimming {
+					d.blanked, d.undimming = false, false
+				}
+				d.conn.connection.checkDisplay()
+			}
+			d.conn.events.publish(Event{Kind: EventDevice, Name: name})
+			if slices.Contains(stateNotifications, name) {
+				d.notifyLocked()
+			}
+			d.access.Unlock()
+		case "ProxyDeath":
+			return E.New("the notification proxy stopped")
+		}
+	}
+}
+
+func (d *darwinNotifications) displayChanges() (posted uint64, unblanked bool) {
+	d.access.Lock()
+	defer d.access.Unlock()
+	return d.displayPosted, d.displayFollowed == d.displayPosted && !d.blanked
+}
+
+func (d *darwinNotifications) close() {
+	d.access.Lock()
+	active := d.active
+	d.active = nil
+	d.access.Unlock()
+	if active != nil {
+		active.stop()
+		<-active.stopped
+	}
+}
+
+func (p *Phone) WatchState(ctx context.Context, name string, emit func(any)) error {
+	read := func(ctx context.Context, c *conn) (any, error) {
+		if name == "locked" {
+			locked, err := c.lockState.locked(ctx, c.device)
+			if err != nil {
+				return nil, E.Cause(err, "read the lock state")
+			}
+			return locked, nil
+		}
+		return c.backlight(ctx)
+	}
+	var last any
+	first := true
+	for {
+		c, release, err := p.connection.acquire(ctx)
+		if err != nil {
+			return err
+		}
+		changed, relayed, cancel := c.darwin.watch()
+		operation, stop := c.operation(ctx)
+		_ = c.darwin.waitReady(operation)
+		for operation.Err() == nil {
+			value, err := read(operation, c)
+			switch {
+			case err != nil && operation.Err() == nil:
+				p.logger.Debug(E.Cause(err, "read ", name))
+			case err == nil && (first || value != last):
+				first, last = false, value
+				emit(value)
+			}
+			var fallback <-chan time.Time
+			var timer *time.Timer
+			if err != nil || !relayed() {
+				timer = time.NewTimer(displayPoll)
+				fallback = timer.C
+			}
+			select {
+			case <-changed:
+			case <-fallback:
+			case <-operation.Done():
+			}
+			if timer != nil {
+				timer.Stop()
+			}
+		}
+		stop()
+		cancel()
+		release()
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+	}
+}
