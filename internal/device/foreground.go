@@ -53,6 +53,14 @@ const (
 // 24C5037i).
 const rolePredicate = `process == "runningboardd" AND eventMessage CONTAINS "Set darwin role to: "`
 
+// followRoles 控制是否用 activity trace + ostrace 追踪 runningboardd 的
+// 进程角色变化。开着的代价：设备端会常驻一次 syscall 级追踪 + os_log 流，
+// DTServiceHub / diagnosticd 长期忙碌，被控设备整体掉帧（本项目注释里
+// 也写了「kept DTServiceHub and diagnosticd busy many times longer than
+// the relay did」）。关掉后前台感知只靠 Instruments 的 app state 推送与
+// darwin 通知，延迟增加几十~几百毫秒，对自动化场景足够。
+const followRoles = false
+
 type roleEntry struct {
 	continuous uint64
 	at         time.Time
@@ -319,7 +327,9 @@ func (f *foreground) track(ctx context.Context, stopped chan struct{}) {
 	f.access.Unlock()
 	backlog := time.Now().Add(appStatesBacklog)
 	go f.confirm(ctx)
-	go f.follow(ctx)
+	if followRoles {
+		go f.follow(ctx)
+	}
 	for {
 		select {
 		case state := <-pushes:

@@ -29,7 +29,10 @@ var stateNotifications = []string{
 	screenUndimmed,
 }
 
-const displayPoll = time.Second
+// displayPoll 是 darwin 通知拿不到时的兜底读取间隔。1 秒一次意味着
+// 被控设备每秒被查一次背光/锁屏状态（WatchState 每次都会先读一遍），
+// 长时间挂着服务会明显耗电，也让连接无法安静下来。
+const displayPoll = 5 * time.Second
 
 type darwinNotifications struct {
 	conn *conn
